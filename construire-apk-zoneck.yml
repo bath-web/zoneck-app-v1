@@ -1,0 +1,122 @@
+name: Construire APK Zoneck
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decompresser le zip (le plus recent zoneck-app*.zip)
+        run: |
+          ZIP=$(ls -t zoneck-app*.zip | head -n 1)
+          echo "Zip utilise : $ZIP"
+          unzip -q -o "$ZIP"
+          if [ -d zoneck_app ]; then cp -r zoneck_app/. . ; rm -rf zoneck_app; fi
+          rm -f zoneck-app*.zip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generer le dossier Android
+        run: |
+          mkdir -p /tmp/keep
+          cp -r lib assets pubspec.yaml analysis_options.yaml /tmp/keep/
+          flutter create . --platforms=android --org com.zoneck --project-name zoneck --description "Zoneck"
+          rm -rf lib assets pubspec.yaml analysis_options.yaml test
+          cp -r /tmp/keep/lib /tmp/keep/assets /tmp/keep/pubspec.yaml /tmp/keep/analysis_options.yaml .
+
+      - name: Regler nom, permissions et liens
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          extra = '''<uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="https"/></intent>
+                  <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="tel"/></intent>
+                  <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="mailto"/></intent>
+              </queries>
+              <application'''
+          s = s.replace('<application', extra, 1)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Zoneck"', s, count=1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Android 6.0 minimum et compatibilite des notifications
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then sed -i 's/flutter\.minSdkVersion/23/' "$f"; fi
+          done
+          python3 - <<'PY'
+          import os
+          for f in ('android/app/build.gradle.kts', 'android/app/build.gradle'):
+              if not os.path.exists(f):
+                  continue
+              s = open(f, encoding='utf-8').read()
+              if 'desugar_jdk_libs' in s or 'compileOptions' not in s:
+                  continue
+              kts = f.endswith('.kts')
+              on = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' if kts else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
+              s = s.replace('compileOptions {', 'compileOptions {\n        ' + on, 1)
+              s += '\ndependencies {\n    ' + dep + '\n}\n'
+              open(f, 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Ecran de demarrage
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          res = 'android/app/src/main/res'
+          os.makedirs(res + '/drawable', exist_ok=True)
+          shutil.copy('assets/images/logo.png', res + '/drawable/splash_logo.png')
+          xml = '<?xml version="1.0" encoding="utf-8"?>\n<layer-list xmlns:android="http://schemas.android.com/apk/res/android">\n<item android:drawable="@color/zk_splash"/>\n<item><bitmap android:gravity="center" android:src="@drawable/splash_logo"/></item>\n</layer-list>\n'
+          os.makedirs(res + '/values', exist_ok=True)
+          open(res + '/values/zk_colors.xml', 'w').write('<?xml version="1.0" encoding="utf-8"?>\n<resources><color name="zk_splash">#2E0256</color></resources>\n')
+          for d in ['drawable', 'drawable-v21']:
+              os.makedirs(res + '/' + d, exist_ok=True)
+              open(res + '/' + d + '/launch_background.xml', 'w').write(xml)
+          PY
+
+      - name: Sons et icone de notification
+        run: |
+          if [ -d android_extra/res ]; then cp -r android_extra/res/. android/app/src/main/res/; fi
+
+      - run: flutter pub get
+
+      - name: Icone Zoneck
+        run: dart run flutter_launcher_icons
+
+      - name: Compiler l'APK
+        run: flutter build apk --release
+
+      - name: Garder l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zoneck-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publier une version
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Zoneck ${{ github.run_number }}
+          files: build/app/outputs/flutter-apk/app-release.apk
